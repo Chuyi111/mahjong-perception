@@ -1,0 +1,12 @@
+{
+  "window_title_hint": "Mahjong Soul",
+  "fps_target": 30,
+  "save_snapshots": true,
+  "roi": {
+    "hand_self": null,
+    "discards": null,
+    "melds_self": null,
+    "dora": null,
+    "winds": null
+  }
+}

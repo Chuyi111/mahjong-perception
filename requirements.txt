@@ -1,0 +1,7 @@
+opencv-python
+mss
+numpy
+pillow
+pywin32
+pydantic
+pytest

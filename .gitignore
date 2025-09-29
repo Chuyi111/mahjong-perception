@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Editors
+.vscode/
+.idea/
+
+# Data/artifacts
+data/
+runs/
+models/
+checkpoints/
+
+# OS
+Thumbs.db
+.DS_Store
