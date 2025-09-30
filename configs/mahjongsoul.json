@@ -1,0 +1,82 @@
+{
+  "capture": {
+    "window_title_hint": "雀魂麻將",
+    "fps_target": 30,
+    "baseline_width": 1542,
+    "baseline_height": 868
+  },
+  "rois": {
+    "hand_self": [
+      163,
+      731,
+      1112,
+      135
+    ],
+    "discards_top": [
+      619,
+      77,
+      291,
+      167
+    ],
+    "discards_right": [
+      905,
+      225,
+      317,
+      223
+    ],
+    "discards_bottom": [
+      598,
+      426,
+      339,
+      249
+    ],
+    "discards_left": [
+      390,
+      213,
+      236,
+      238
+    ],
+    "melds_self": [
+      1064,
+      728,
+      467,
+      132
+    ],
+    "melds_top": [
+      282,
+      10,
+      311,
+      89
+    ],
+    "melds_right": [
+      1189,
+      9,
+      152,
+      231
+    ],
+    "melds_left": [
+      60,
+      476,
+      198,
+      282
+    ],
+    "dora": [
+      10,
+      25,
+      254,
+      91
+    ],
+    "winds_round": [
+      731,
+      306,
+      86,
+      70
+    ],
+    "points_board": [
+      635,
+      241,
+      278,
+      192
+    ]
+  }
+}
