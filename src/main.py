@@ -15,9 +15,12 @@ from perception.utils.window_finder import (
 )
 from perception.capture.screen_capture import ScreenCapturer, annotate_hud
 from perception.config.io import load_config
+from perception.config.model import Rect
 from perception.preprocess.roi import preprocess_rois
 from perception.preprocess.orient import rotate_region_by_name
-from perception.config.model import Rect
+from perception.preprocess.deskew import mild_deskew_by_region
+from perception.tiles.tilers import tile_hand_self, tile_discards, tile_melds
+from perception.tiles.recognizer import TemplateRecognizer
 from perception.utils.capture_exclude import set_window_exclude_from_capture
 
 
@@ -42,6 +45,11 @@ def ensure_dir(p: str | Path) -> None:
 def get_cv_window_hwnd(title: str) -> Optional[int]:
     hwnd = win32gui.FindWindow(None, title)
     return int(hwnd) if hwnd else None
+
+def put_label(img, text, xy, color=(255, 255, 255)):
+    x, y = xy
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
 
 
 # -------------------- main --------------------
@@ -79,6 +87,9 @@ def main():
     rois_dict: Dict[str, Optional[Rect]] = cfg.rois.model_dump()
     rois_dict = maybe_scale_rois(rois_dict, cfg.capture.baseline_width, cfg.capture.baseline_height, cur_w, cur_h)
 
+    # Initialize recognizer (loads templates under assets/templates/**)
+    recognizer = TemplateRecognizer(template_root="assets/templates")
+
     # Open preview and exclude it from capture to avoid mirror recursion
     win_title = "Mahjong Perception - Capture"
     cv2.namedWindow(win_title, cv2.WINDOW_AUTOSIZE)
@@ -100,22 +111,22 @@ def main():
     while True:
         frame = cap.grab()  # BGR in client coordinates
         if frame is None or frame.size == 0:
-            # Shouldn't happen with MSS, but guard anyway
             raw = cv2.waitKey(1)
-            if raw == 27: break
+            if raw != -1 and (raw & 0xFF) in (27, ord('q')):
+                break
             continue
 
-        # Crop + normalize bands for each named ROI
-        crops = preprocess_rois(frame, rois_dict)
-
-        # Rotate opponent regions to self orientation
-        for name, img in list(crops.items()):
-            if img is None:
-                continue
-            crops[name] = rotate_region_by_name(img, name)
-
-        # Visualization
+        # Start building visualization early so it's always defined
         vis = frame.copy()
+
+        # Crop + normalize bands for each named ROI and rotate to self orientation
+        crops = preprocess_rois(frame, rois_dict)
+        for k, v in list(crops.items()):
+            if v is None:
+                continue
+            crops[k] = rotate_region_by_name(v, k)
+
+        # Draw ROI boxes if enabled
         if show_boxes:
             for name, rxywh in rois_dict.items():
                 if rxywh is None:
@@ -127,6 +138,71 @@ def main():
                 cv2.putText(vis, name, (l0 + 4, t0 + 18),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
+        # ---------------- Recognition with "unknown" fallback ----------------
+        # Collect labels to draw: (text, (x,y), color)
+        labels_to_draw: list[tuple[str, tuple[int, int], tuple[int, int, int]]] = []
+
+        # Hand (no deskew)
+        if crops.get("hand_self") is not None:
+            tiles = tile_hand_self(crops["hand_self"])
+            preds = recognizer.classify_many(tiles, score_thresh=0.40)  # -> list[Optional[str]]
+            band = rois_dict.get("hand_self")
+            if band:
+                l0, t0, w0, h0 = band
+                step = w0 // max(1, len(preds))
+                for i, cls in enumerate(preds):
+                    label = cls if cls is not None else "unknown"
+                    color = (180, 180, 180) if cls is None else (255, 255, 255)
+                    x = l0 + i * step + 6
+                    y = t0 + h0 - 8
+                    labels_to_draw.append((label, (x, y), color))
+
+        # Discards (deskew per region)
+        for key in ("discards_top", "discards_right", "discards_bottom", "discards_left"):
+            if crops.get(key) is None:
+                continue
+            tiles = tile_discards(crops[key])
+            tiles = [mild_deskew_by_region(t, key) for t in tiles]
+            preds = recognizer.classify_many(tiles, score_thresh=0.40)
+            band = rois_dict.get(key)
+            if band:
+                l0, t0, w0, h0 = band
+                cols, rows = 6, 3
+                cw = w0 // cols
+                ch = h0 // rows
+                for idx, cls in enumerate(preds):
+                    label = cls if cls is not None else "unknown"
+                    color = (180, 180, 180) if cls is None else (255, 255, 255)
+                    cx = idx % cols
+                    cy = idx // cols
+                    x = l0 + cx * cw + 4
+                    y = t0 + (cy + 1) * ch - 6
+                    labels_to_draw.append((label, (x, y), color))
+
+        # Melds (deskew per region; coarse slots)
+        for key in ("melds_self", "melds_top", "melds_right", "melds_left"):
+            if crops.get(key) is None:
+                continue
+            tiles = tile_melds(crops[key])
+            tiles = [mild_deskew_by_region(t, key) for t in tiles]
+            preds = recognizer.classify_many(tiles, score_thresh=0.4)
+            band = rois_dict.get(key)
+            if band:
+                l0, t0, w0, h0 = band
+                n = max(1, len(preds))
+                step = w0 // n
+                for i, cls in enumerate(preds):
+                    label = cls if cls is not None else "unknown"
+                    color = (180, 180, 180) if cls is None else (255, 255, 255)
+                    x = l0 + i * step + 4
+                    y = t0 + h0 // 2
+                    labels_to_draw.append((label, (x, y), color))
+
+        # Draw labels on vis
+        for text, (x, y), color in labels_to_draw:
+            put_label(vis, text, (x, y), color=color)
+
+        # FPS / HUD
         frames += 1
         now = time.time()
         if now - last >= 1.0:
@@ -152,6 +228,7 @@ def main():
                 break
             elif key == ord('s'):
                 ts = int(now * 1000)
+                # Save current preprocessed ROI crops for debugging
                 for k, img in crops.items():
                     if img is None:
                         continue
@@ -166,7 +243,7 @@ def main():
                 topmost = not topmost
                 set_window_topmost(hwnd_game, topmost)
             elif key == ord('r'):
-                # Reload config on the fly (useful if you re-calibrate)
+                # Reload config on the fly (useful if you re-calibrated)
                 cfg_new = load_config(cfg_path)
                 rd = cfg_new.rois.model_dump()
                 rois_dict = maybe_scale_rois(rd, cfg_new.capture.baseline_width, cfg_new.capture.baseline_height, cur_w, cur_h)
