@@ -2,11 +2,10 @@
 import time
 import atexit
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import win32gui
 
 from perception.utils.window_finder import (
     set_process_dpi_aware,
@@ -14,195 +13,161 @@ from perception.utils.window_finder import (
     set_window_topmost,
 )
 from perception.capture.screen_capture import ScreenCapturer, annotate_hud
-from perception.config.io import load_config
-from perception.config.model import Rect
-from perception.preprocess.roi import preprocess_rois
-from perception.preprocess.orient import rotate_region_by_name
-from perception.preprocess.deskew import mild_deskew_by_region
-from perception.tiles.tilers import tile_hand_self, tile_discards, tile_melds
-from perception.tiles.recognizer import TemplateRecognizer
 from perception.utils.capture_exclude import set_window_exclude_from_capture
 
+# NEW: YOLOv8-seg ONNX detector wrapper (ROI-aware)
+from perception.detectors.yolo_seg_onnx import YoloSegOnnxDetector
+# EXISTING: your tile CNN recognizer
+from perception.tiles.cnn_recognizer import CNNRecognizer
 
-# -------------------- helpers --------------------
-def scale_rect(rect: Rect, sx: float, sy: float) -> Rect:
-    l, t, w, h = rect
-    return (int(round(l * sx)), int(round(t * sy)), int(round(w * sx)), int(round(h * sy)))
 
-def maybe_scale_rois(rois: Dict[str, Optional[Rect]], base_w: int, base_h: int,
-                     cur_w: int, cur_h: int) -> Dict[str, Optional[Rect]]:
-    if base_w <= 0 or base_h <= 0 or (base_w == cur_w and base_h == cur_h):
-        return rois
-    sx, sy = cur_w / base_w, cur_h / base_h
-    out: Dict[str, Optional[Rect]] = {}
-    for k, v in rois.items():
-        out[k] = None if v is None else scale_rect(tuple(v), sx, sy)
-    return out
+# -------------------- Config --------------------
+# Path to your exported YOLOv8-seg ONNX model (ROI-aware detector)
+DET_ONNX = "models/detectors/tiles_roi_yolov8n_seg.onnx"
 
-def ensure_dir(p: str | Path) -> None:
-    Path(p).parent.mkdir(parents=True, exist_ok=True)
+# Class order MUST match your training YAML 'names'
+ROI_CLASSES = [
+    "tile_discards_bottom",  # 0
+    "tile_discards_left",    # 1
+    "tile_discards_right",   # 2
+    "tile_discards_top",     # 3
+    "tile_hand_self",        # 4
+    "tile_melds_left",       # 5
+    "tile_melds_right",      # 6
+    "tile_melds_self",       # 7
+    "tile_melds_top",        # 8
+]
 
+# Tile classifier (your CNN)
+CNN_ONNX = "models/tile_cnn/tile_cnn.onnx"
+CNN_CLASSES = "models/tile_cnn/classes.json"
+CNN_IMG_SIZE = 128
+
+# Detector thresholds (hotkeys to change at runtime)
+CONF_THR = 0.35
+IOU_THR = 0.50
+
+# Window title candidates
+TITLE_HINTS = ["雀魂麻將", "雀魂", "Mahjong Soul"]
+
+
+# -------------------- Helpers --------------------
 def get_cv_window_hwnd(title: str) -> Optional[int]:
-    hwnd = win32gui.FindWindow(None, title)
-    return int(hwnd) if hwnd else None
+    try:
+        import win32gui
+        hwnd = win32gui.FindWindow(None, title)
+        return int(hwnd) if hwnd else None
+    except Exception:
+        return None
 
 def put_label(img, text, xy, color=(255, 255, 255)):
     x, y = xy
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
 
+def crop_square(img: np.ndarray, xyxy, pad: int = 3) -> np.ndarray:
+    x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
+    x1 = max(0, x1 - pad)
+    y1 = max(0, y1 - pad)
+    x2 = min(img.shape[1] - 1, x2 + pad)
+    y2 = min(img.shape[0] - 1, y2 + pad)
+    return img[y1:y2 + 1, x1:x2 + 1]
 
-# -------------------- main --------------------
+
+# -------------------- Main --------------------
 def main():
     set_process_dpi_aware()
 
-    # Load config (ROIs + calibration baseline size)
-    cfg_path = "configs/mahjongsoul.json"
-    cfg = load_config(cfg_path)
-
-    # Find the Mahjong Soul window (localized title first)
-    found = (
-        find_window_by_titles(cfg.capture.window_title_hint)
-        or find_window_by_titles("雀魂麻將")
-        or find_window_by_titles("雀魂")
-        or find_window_by_titles("Mahjong Soul")
-    )
+    # Find Mahjong Soul window (client area)
+    found = None
+    for hint in TITLE_HINTS:
+        found = find_window_by_titles(hint)
+        if found:
+            break
     if not found:
-        print("Mahjong Soul window not found. Open it (not minimized) and try again.")
+        print("[ERR] Mahjong Soul window not found. Open the table and run again.")
         return
 
     hwnd_game, rect = found
     l, t, r, b = rect
-    cur_w, cur_h = r - l, b - t
-    print(f"[INFO] Capturing client area at {rect} (size {cur_w}x{cur_h})")
+    W, H = r - l, b - t
+    print(f"[INFO] Capturing client area {rect} size={W}x{H}")
 
-    # Keep the game on top to avoid occlusion by other windows
+    # Keep game window on top while preview is open
     set_window_topmost(hwnd_game, True)
     atexit.register(lambda: set_window_topmost(hwnd_game, False))
 
-    # Prepare capture
+    # Screen capturer for that rect
     cap = ScreenCapturer(rect)
 
-    # Prepare ROIs (scaled to current size if needed)
-    rois_dict: Dict[str, Optional[Rect]] = cfg.rois.model_dump()
-    rois_dict = maybe_scale_rois(rois_dict, cfg.capture.baseline_width, cfg.capture.baseline_height, cur_w, cur_h)
-
-    # Initialize recognizer (loads templates under assets/templates/**)
-    recognizer = TemplateRecognizer(template_root="assets/templates")
-
-    # Open preview and exclude it from capture to avoid mirror recursion
-    win_title = "Mahjong Perception - Capture"
+    # Create preview window and exclude it from capture (avoid mirror)
+    win_title = "Mahjong Perception (Detector Mode)"
     cv2.namedWindow(win_title, cv2.WINDOW_AUTOSIZE)
     cv2.moveWindow(win_title, 50, 50)
+    hwnd_prev = get_cv_window_hwnd(win_title)
+    if hwnd_prev:
+        set_window_exclude_from_capture(hwnd_prev, True)
 
-    hwnd_preview = get_cv_window_hwnd(win_title)
-    if hwnd_preview:
-        ok = set_window_exclude_from_capture(hwnd_preview, True)
-        print(f"[INFO] Exclude preview from capture: {ok}")
+    # Instantiate models
+    detector = YoloSegOnnxDetector(
+        onnx_path=DET_ONNX,
+        input_size=768,       # match your export
+        is_xywh=True,         # set False if your ONNX outputs xyxy already
+        class_names=ROI_CLASSES,
+    )
+    recognizer = CNNRecognizer(
+        onnx_path=CNN_ONNX,
+        classes_path=CNN_CLASSES,
+        img_size=CNN_IMG_SIZE,
+    )
 
-    # Flags
+    # Flags / knobs
     show_preview = True
-    show_boxes = True
     topmost = True
+    conf_thr = CONF_THR
+    iou_thr = IOU_THR
 
-    # FPS
+    # FPS HUD
     last, frames, fps = time.time(), 0, 0.0
 
     while True:
-        frame = cap.grab()  # BGR in client coordinates
+        frame = cap.grab()
         if frame is None or frame.size == 0:
             raw = cv2.waitKey(1)
             if raw != -1 and (raw & 0xFF) in (27, ord('q')):
                 break
             continue
 
-        # Start building visualization early so it's always defined
         vis = frame.copy()
 
-        # Crop + normalize bands for each named ROI and rotate to self orientation
-        crops = preprocess_rois(frame, rois_dict)
-        for k, v in list(crops.items()):
-            if v is None:
+        # -------- DETECT (global) --------
+        dets = detector.infer(frame, conf_thr=conf_thr, iou_thr=iou_thr, max_det=300)
+
+        # Bucket by ROI class
+        buckets: Dict[str, List[dict]] = {name: [] for name in ROI_CLASSES}
+        for d in dets:
+            name = d["cls_name"] if d["cls_name"] in buckets else ROI_CLASSES[d["cls_id"]]
+            buckets[name].append(d)
+
+        # -------- CLASSIFY each crop --------
+        for roi_name, items in buckets.items():
+            if not items:
                 continue
-            crops[k] = rotate_region_by_name(v, k)
+            crops = [crop_square(frame, d["xyxy"], pad=4) for d in items]
+            outs = recognizer.classify_many(crops, score_thresh=0.60) if crops else []
+            labels = [c if c is not None else "unknown" for c in outs]
 
-        # Draw ROI boxes if enabled
-        if show_boxes:
-            for name, rxywh in rois_dict.items():
-                if rxywh is None:
-                    continue
-                l0, t0, w0, h0 = rxywh
-                cv2.rectangle(vis, (l0, t0), (l0 + w0, t0 + h0), (0, 255, 255), 2)
-                cv2.putText(vis, name, (l0 + 4, t0 + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, name, (l0 + 4, t0 + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            # Draw
+            for d, lab in zip(items, labels):
+                x1, y1, x2, y2 = [int(round(v)) for v in d["xyxy"]]
+                # Box color per ROI (simple hash)
+                roi_idx = ROI_CLASSES.index(roi_name)
+                color = ((37 * (roi_idx + 3)) % 255, (97 * (roi_idx + 5)) % 255, (173 * (roi_idx + 7)) % 255)
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+                text = f"{lab} @{roi_name.split('_',1)[1]}"
+                put_label(vis, text, (x1 + 4, y1 - 6), color=(255, 255, 255) if lab != "unknown" else (180, 180, 180))
 
-        # ---------------- Recognition with "unknown" fallback ----------------
-        # Collect labels to draw: (text, (x,y), color)
-        labels_to_draw: list[tuple[str, tuple[int, int], tuple[int, int, int]]] = []
-
-        # Hand (no deskew)
-        if crops.get("hand_self") is not None:
-            tiles = tile_hand_self(crops["hand_self"])
-            preds = recognizer.classify_many(tiles, score_thresh=0.40)  # -> list[Optional[str]]
-            band = rois_dict.get("hand_self")
-            if band:
-                l0, t0, w0, h0 = band
-                step = w0 // max(1, len(preds))
-                for i, cls in enumerate(preds):
-                    label = cls if cls is not None else "unknown"
-                    color = (180, 180, 180) if cls is None else (255, 255, 255)
-                    x = l0 + i * step + 6
-                    y = t0 + h0 - 8
-                    labels_to_draw.append((label, (x, y), color))
-
-        # Discards (deskew per region)
-        for key in ("discards_top", "discards_right", "discards_bottom", "discards_left"):
-            if crops.get(key) is None:
-                continue
-            tiles = tile_discards(crops[key])
-            tiles = [mild_deskew_by_region(t, key) for t in tiles]
-            preds = recognizer.classify_many(tiles, score_thresh=0.40)
-            band = rois_dict.get(key)
-            if band:
-                l0, t0, w0, h0 = band
-                cols, rows = 6, 3
-                cw = w0 // cols
-                ch = h0 // rows
-                for idx, cls in enumerate(preds):
-                    label = cls if cls is not None else "unknown"
-                    color = (180, 180, 180) if cls is None else (255, 255, 255)
-                    cx = idx % cols
-                    cy = idx // cols
-                    x = l0 + cx * cw + 4
-                    y = t0 + (cy + 1) * ch - 6
-                    labels_to_draw.append((label, (x, y), color))
-
-        # Melds (deskew per region; coarse slots)
-        for key in ("melds_self", "melds_top", "melds_right", "melds_left"):
-            if crops.get(key) is None:
-                continue
-            tiles = tile_melds(crops[key])
-            tiles = [mild_deskew_by_region(t, key) for t in tiles]
-            preds = recognizer.classify_many(tiles, score_thresh=0.4)
-            band = rois_dict.get(key)
-            if band:
-                l0, t0, w0, h0 = band
-                n = max(1, len(preds))
-                step = w0 // n
-                for i, cls in enumerate(preds):
-                    label = cls if cls is not None else "unknown"
-                    color = (180, 180, 180) if cls is None else (255, 255, 255)
-                    x = l0 + i * step + 4
-                    y = t0 + h0 // 2
-                    labels_to_draw.append((label, (x, y), color))
-
-        # Draw labels on vis
-        for text, (x, y), color in labels_to_draw:
-            put_label(vis, text, (x, y), color=color)
-
-        # FPS / HUD
+        # -------- HUD --------
         frames += 1
         now = time.time()
         if now - last >= 1.0:
@@ -211,45 +176,48 @@ def main():
 
         hud = {
             "FPS": f"{fps:.1f}",
-            "Size": f"{cur_w}x{cur_h}",
             "TopMost": topmost,
-            "ROIs": sum(1 for v in rois_dict.values() if v is not None),
+            "Det": Path(DET_ONNX).name,
+            "Conf": f"{conf_thr:.2f}",
+            "IoU": f"{iou_thr:.2f}",
+            "CNN": Path(CNN_ONNX).name,
         }
         vis = annotate_hud(vis, hud)
 
         if show_preview:
             cv2.imshow(win_title, vis)
 
-        # ---- input handling (safe) ----
+        # -------- Keys --------
         raw = cv2.waitKey(1)
         if raw != -1:
             key = raw & 0xFF
-            if key in (27, ord('q')):  # ESC or Q
+            if key in (27, ord('q')):  # ESC/Q
                 break
-            elif key == ord('s'):
-                ts = int(now * 1000)
-                # Save current preprocessed ROI crops for debugging
-                for k, img in crops.items():
-                    if img is None:
-                        continue
-                    ensure_dir(f"data/{k}_{ts}.png")
-                    cv2.imwrite(f"data/{k}_{ts}.png", img)
-                print(f"[INFO] Saved ROI crops at ts {ts}")
             elif key == ord('v'):
                 show_preview = not show_preview
-            elif key == ord('b'):
-                show_boxes = not show_boxes
             elif key == ord('t'):
                 topmost = not topmost
                 set_window_topmost(hwnd_game, topmost)
-            elif key == ord('r'):
-                # Reload config on the fly (useful if you re-calibrated)
-                cfg_new = load_config(cfg_path)
-                rd = cfg_new.rois.model_dump()
-                rois_dict = maybe_scale_rois(rd, cfg_new.capture.baseline_width, cfg_new.capture.baseline_height, cur_w, cur_h)
-                print("[INFO] Reloaded ROIs from config.")
+            elif key == ord('s'):
+                ts = int(time.time() * 1000)
+                out = Path("data") / f"frame_{ts}.png"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out), vis)
+                print(f"[INFO] Saved frame -> {out}")
+            # Threshold tuning
+            elif key == ord('+') or key == ord('='):
+                conf_thr = min(0.90, conf_thr + 0.02)
+                print(f"[DET] conf_thr -> {conf_thr:.2f}")
+            elif key == ord('-') or key == ord('_'):
+                conf_thr = max(0.05, conf_thr - 0.02)
+                print(f"[DET] conf_thr -> {conf_thr:.2f}")
+            elif key == ord(']'):
+                iou_thr = min(0.90, iou_thr + 0.02)
+                print(f"[DET] iou_thr -> {iou_thr:.2f}")
+            elif key == ord('['):
+                iou_thr = max(0.10, iou_thr - 0.02)
+                print(f"[DET] iou_thr -> {iou_thr:.2f}")
 
-    # cleanup
     set_window_topmost(hwnd_game, False)
     cv2.destroyAllWindows()
 

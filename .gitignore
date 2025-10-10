@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 .env
+.yolo-train
+.mahjong-run
 
 # Editors
 .vscode/
@@ -10,6 +12,7 @@ __pycache__/
 
 # Data/artifacts
 data/
+data_yolo/
 runs/
 models/
 checkpoints/

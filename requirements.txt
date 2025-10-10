@@ -1,7 +1,15 @@
-opencv-python
-mss
-numpy
-pillow
-pywin32
-pydantic
-pytest
+# Core
+numpy==1.26.4
+opencv-python==4.10.0.84
+mss==9.0.1
+pillow==10.4.0
+pywin32==306
+pydantic==2.7.4
+
+# ONNX inference
+onnxruntime==1.18.1
+# (If you have NVIDIA CUDA and want GPU inference, use ONE of these instead of the CPU build:)
+# onnxruntime-gpu==1.18.1
+
+# Testing
+pytest==8.2.2
