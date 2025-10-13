@@ -1,0 +1,8 @@
+train tile recog:
+python -m tools.train_tile_cnn --data data/tiles --epochs 20 --img 128 --batch 128 --out models/tile_cnn
+
+train bc decision making:
+python -m src.decision.offline.train_bc --db "C:\Users\micha\Desktop\Current Work\麻将\tenhou_logs\datasets_positive.db" --tables "Discard" --sample_limit 250000 --sample_stride 2 --val_ratio 0.1 --out "C:\Users\micha\Desktop\Current Work\麻将\mahjong-perception\runs\bc_policy" --epochs 30 --batch 1024 --lr 0.002 --hidden 512 --workers 4
+
+train calls:
+python -m src.decision.offline.train_calls --db "C:\Users\micha\Desktop\Current Work\麻将\tenhou_logs\datasets_positive.db" --tables "Skip,Chi,Pon,DaiMinKan" --sample_limit 200000 --p_keep_call 0.6 --skip_weight 2.5 --label_smoothing 0.05 --entropy_reg 0.001 --val_ratio 0.1 --out "C:\Users\micha\Desktop\Current Work\麻将\mahjong-perception\runs\calls_policy" --epochs 15 --batch_rows 256 --hidden 768 --dropout 0.15 --lr 0.002 --workers 4
